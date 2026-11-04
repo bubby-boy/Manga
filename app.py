@@ -1,141 +1,192 @@
-
 import os
 import re
+import io
 import json
-import uuid
 import base64
-import hmac
-import requests
+import socket
+import ipaddress
+import zipfile
+from urllib.parse import urljoin, urlparse, quote
+from threading import Lock
 
-from urllib.parse import quote, urlparse
-from flask import Flask, request, jsonify, render_template_string
+import requests
+from bs4 import BeautifulSoup
+from flask import Flask, request, jsonify, render_template_string, Response, abort
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET", "change-this-animeverse-secret")
+HTTP = requests.Session()
+HTTP.headers.update({
+    "User-Agent": "Mozilla/5.0 (compatible; AnimeVerseReader/1.0; +https://example.invalid)"
+})
+HTTP_TIMEOUT = 18
+MAX_HTML_BYTES = 5 * 1024 * 1024
+MAX_IMAGE_BYTES = 18 * 1024 * 1024
+MAX_CHAPTER_PAGES = 250
+lock = Lock()
 
-ANILIST_API = "https://graphql.anilist.co"
-
-# GitHub configuration: set these in Blitz Environment Variables.
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
-GITHUB_FILE = "data/anime_links.json"
+GITHUB_FILE = os.environ.get("GITHUB_FILE", "data/anime_links.json")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "change-this-admin-password")
+LOCAL_DB = "anime_links.json"
 
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+# ---------- Safe URL / fetch helpers ----------
 
-manga_cache = None
-
-
-# ============================================
-# ANILIST API
-# ============================================
-
-def anilist_query(search=""):
-    query = """
-    query ($page: Int, $perPage: Int, $search: String) {
-        Page(page: $page, perPage: $perPage) {
-            media(
-                type: MANGA,
-                search: $search,
-                sort: SCORE_DESC,
-                isAdult: false
-            ) {
-                id
-                title {
-                    english
-                    romaji
-                    native
-                }
-                description(asHtml: false)
-                coverImage {
-                    extraLarge
-                    large
-                }
-                averageScore
-                popularity
-                chapters
-                volumes
-                status
-                genres
-                siteUrl
-                format
-            }
-        }
-    }
-    """
-
-    response = requests.post(
-        ANILIST_API,
-        json={
-            "query": query,
-            "variables": {
-                "page": 1,
-                "perPage": 100,
-                "search": search or None
-            }
-        },
-        timeout=30
-    )
-
-    response.raise_for_status()
-    result = response.json()
-
-    if result.get("errors"):
-        raise RuntimeError("AniList API error")
-
-    mangas = result["data"]["Page"]["media"]
-
-    for manga in mangas:
-        titles = manga["title"]
-
-        manga["display_title"] = (
-            titles.get("english")
-            or titles.get("romaji")
-            or titles.get("native")
-            or "Unknown"
+def is_mangatown_url(url):
+    try:
+        p = urlparse(url)
+        host = (p.hostname or "").lower()
+        return p.scheme in ("http", "https") and (
+            host == "mangatown.com" or host.endswith(".mangatown.com")
         )
+    except Exception:
+        return False
 
-        manga["cover"] = (
-            manga["coverImage"].get("extraLarge")
-            or manga["coverImage"].get("large")
-            or ""
-        )
+def safe_public_url(url):
+    """Allow public HTTP(S) URLs only; block localhost/private-network targets."""
+    try:
+        p = urlparse(url)
+        if p.scheme not in ("http", "https") or not p.hostname:
+            return False
+        host = p.hostname.lower()
+        if host in ("localhost",) or host.endswith(".localhost") or host.endswith(".local"):
+            return False
+        try:
+            addresses = socket.getaddrinfo(host, None)
+            for item in addresses:
+                ip = ipaddress.ip_address(item[4][0])
+                if not ip.is_global:
+                    return False
+        except Exception:
+            return False
+        return True
+    except Exception:
+        return False
 
-        manga["description"] = (
-            manga.get("description") or "No description available."
-        )
+def fetch_html(url, mangatown_only=False):
+    if mangatown_only and not is_mangatown_url(url):
+        raise ValueError("Please use a MangaTown URL.")
+    if not safe_public_url(url):
+        raise ValueError("That URL is not a publicly reachable website.")
+    r = HTTP.get(url, timeout=HTTP_TIMEOUT, stream=True, allow_redirects=True)
+    r.raise_for_status()
+    if mangatown_only and not is_mangatown_url(r.url):
+        raise ValueError("MangaTown redirected to a different website. The request was stopped.")
+    data = bytearray()
+    for chunk in r.iter_content(65536):
+        data.extend(chunk)
+        if len(data) > MAX_HTML_BYTES:
+            raise ValueError("The page is too large to scan.")
+    return r.url, data.decode(r.encoding or "utf-8", errors="replace")
 
-        slug = re.sub(
-            r"[^a-z0-9]+",
-            "_",
-            manga["display_title"].lower()
-        ).strip("_")
+def clean_text(value):
+    return re.sub(r"\s+", " ", value or "").strip()
 
-        manga["mangatown_url"] = (
-            f"https://www.mangatown.com/manga/{quote(slug)}/"
-        )
+def abs_http_url(base, value):
+    if not value:
+        return ""
+    value = value.strip()
+    if value.startswith("//"):
+        value = "https:" + value
+    result = urljoin(base, value)
+    p = urlparse(result)
+    if p.scheme not in ("http", "https"):
+        return ""
+    return result
 
-    return mangas
+def parse_series(url):
+    final_url, html = fetch_html(url, mangatown_only=True)
+    soup = BeautifulSoup(html, "html.parser")
+    title_el = soup.select_one(".title-top, h1, .detail_info h1, .detail_info .title")
+    title = clean_text(title_el.get_text(" ", strip=True)) if title_el else "MangaTown Series"
+    cover_el = soup.select_one(".detail_info img, .detail_info .cover img, .manga_detail img")
+    cover = ""
+    if cover_el:
+        cover = abs_http_url(final_url, cover_el.get("data-src") or cover_el.get("src") or "")
+    chapters = []
+    seen = set()
+    selectors = [
+        ".chapter_content .chapter_list a",
+        ".chapter_content a",
+        "#chapter_list a",
+        ".chapter-list a",
+        ".chapter_list a"
+    ]
+    for selector in selectors:
+        for a in soup.select(selector):
+            href = abs_http_url(final_url, a.get("href"))
+            label = clean_text(a.get_text(" ", strip=True))
+            if href and is_mangatown_url(href) and href not in seen and label:
+                seen.add(href)
+                chapters.append({"title": label, "url": href})
+        if chapters:
+            break
+    if not chapters:
+        # Conservative fallback: only chapter-looking links within the series path.
+        base_path = urlparse(final_url).path.rstrip("/") + "/"
+        for a in soup.select("a[href]"):
+            href = abs_http_url(final_url, a.get("href"))
+            label = clean_text(a.get_text(" ", strip=True))
+            if not href or not is_mangatown_url(href) or not label:
+                continue
+            path = urlparse(href).path
+            if path.startswith(base_path) and re.search(r"(chapter|ch[-_/]|\bc\d)", path, re.I):
+                if href not in seen:
+                    seen.add(href)
+                    chapters.append({"title": label, "url": href})
+    return {"title": title, "url": final_url, "cover": cover, "chapters": chapters}
 
+def extract_total_pages(html):
+    patterns = [
+        r"\btotal_pages\s*[:=]\s*['\"]?(\d+)",
+        r"\btotalPages\s*[:=]\s*['\"]?(\d+)",
+        r"\btotal_page\s*[:=]\s*['\"]?(\d+)"
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, html, re.I)
+        if m:
+            try:
+                return max(1, min(int(m.group(1)), MAX_CHAPTER_PAGES))
+            except Exception:
+                pass
+    return 0
 
-# ============================================
-# GITHUB DATABASE
-# ============================================
+def parse_reader_page(url):
+    final_url, html = fetch_html(url, mangatown_only=True)
+    soup = BeautifulSoup(html, "html.parser")
+    images = []
+    seen = set()
+    selectors = [
+        "#image",
+        "#viewer .image",
+        "#viewer img",
+        ".reader-main img",
+        ".chapter-reader img",
+        ".manga-page img"
+    ]
+    for selector in selectors:
+        for img in soup.select(selector):
+            src = img.get("data-src") or img.get("data-original") or img.get("data-lazy-src") or img.get("src")
+            src = abs_http_url(final_url, src)
+            if src and src not in seen:
+                seen.add(src)
+                images.append(src)
+        if images:
+            break
 
-def github_configured():
-    return all([
-        GITHUB_TOKEN,
-        GITHUB_OWNER,
-        GITHUB_REPO
-    ])
+    # Some MangaTown layouts expose total_pages and serve one image per numbered HTML page.
+    total = extract_total_pages(html)
+    if not images and total:
+        base = final_url
+        if not base.endswith("/"):
+            base += "/"
+        images = [base + ("" if i == 1 else f"{i}.html") for i in range(1, total + 1)]
+    return {"url": final_url, "images": images[:MAX_CHAPTER_PAGES], "total": total or len(images)}
 
-
-def github_url():
-    return (
-        f"https://api.github.com/repos/"
-        f"{GITHUB_OWNER}/{GITHUB_REPO}/contents/{GITHUB_FILE}"
-    )
-
+# ---------- Anime links storage (GitHub Contents API with local fallback) ----------
 
 def github_headers():
     return {
@@ -144,1027 +195,247 @@ def github_headers():
         "X-GitHub-Api-Version": "2022-11-28"
     }
 
+def github_file_url():
+    return f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{quote(GITHUB_FILE, safe='/')}"
 
-def read_catalog():
-    if not github_configured():
-        raise RuntimeError("GitHub is not configured.")
-
-    response = requests.get(
-        github_url(),
-        headers=github_headers(),
-        params={"ref": GITHUB_BRANCH},
-        timeout=20
-    )
-
-    if response.status_code == 404:
-        return {"entries": []}, None
-
-    response.raise_for_status()
-
-    file_data = response.json()
-
-    content = base64.b64decode(
-        file_data["content"]
-    ).decode("utf-8")
-
-    return json.loads(content), file_data["sha"]
-
-
-def write_catalog(catalog, sha=None):
-    content = json.dumps(
-        catalog,
-        indent=4,
-        ensure_ascii=False
-    )
-
-    encoded = base64.b64encode(
-        content.encode("utf-8")
-    ).decode("utf-8")
-
-    payload = {
-        "message": "Update AnimeVerse media library",
-        "content": encoded,
-        "branch": GITHUB_BRANCH
-    }
-
-    if sha:
-        payload["sha"] = sha
-
-    response = requests.put(
-        github_url(),
-        headers=github_headers(),
-        json=payload,
-        timeout=30
-    )
-
-    response.raise_for_status()
-
-
-# ============================================
-# ADMIN AUTHENTICATION
-# ============================================
-
-def authorized(data):
-    supplied = str(data.get("password", ""))
-    return bool(ADMIN_PASSWORD) and hmac.compare_digest(
-        supplied,
-        ADMIN_PASSWORD
-    )
-
-
-# ============================================
-# MANGA LIBRARY API
-# ============================================
-
-@app.route("/api/manga")
-def manga_api():
-    global manga_cache
-
-    search = request.args.get("q", "").strip()
-
+def load_anime_items():
+    if GITHUB_TOKEN and GITHUB_OWNER and GITHUB_REPO:
+        try:
+            r = HTTP.get(github_file_url(), headers=github_headers(),
+                         params={"ref": GITHUB_BRANCH}, timeout=12)
+            if r.status_code == 200:
+                payload = r.json()
+                raw = base64.b64decode(payload.get("content", "")).decode("utf-8")
+                data = json.loads(raw)
+                return data if isinstance(data, list) else []
+            if r.status_code == 404:
+                return []
+        except Exception:
+            pass
     try:
-        if not search and manga_cache is not None:
-            mangas = manga_cache
-        else:
-            mangas = anilist_query(search)
-
-            if not search:
-                manga_cache = mangas
-
-        return jsonify({
-            "success": True,
-            "count": len(mangas),
-            "manga": mangas
-        })
-
+        with open(LOCAL_DB, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
     except Exception:
-        app.logger.exception("AniList request failed")
-        return jsonify({
-            "success": False,
-            "error": "Could not load manga. Please try again."
-        }), 502
+        return []
 
-
-# ============================================
-# MEDIA LIBRARY API
-# ============================================
-
-@app.route("/api/media")
-def media_api():
-    media_id = request.args.get("media_id", "").strip()
-
-    try:
-        catalog, _ = read_catalog()
-
-        entries = [
-            entry for entry in catalog.get("entries", [])
-            if str(entry.get("media_id")) == media_id
-        ]
-
-        return jsonify({
-            "success": True,
-            "entries": entries
-        })
-
-    except Exception:
-        app.logger.exception("GitHub catalog read failed")
-        return jsonify({
-            "success": False,
-            "error": "Unable to load GitHub media library."
-        }), 502
-
-
-# ============================================
-# ADD MEDIA TO GITHUB
-# ============================================
-
-@app.route("/api/media", methods=["POST"])
-def add_media():
-    data = request.get_json(silent=True) or {}
-
-    if not authorized(data):
-        return jsonify({"error": "Invalid admin password."}), 401
-
-    media_id = str(data.get("media_id", "")).strip()
-    media_name = str(data.get("media_name", "")).strip()
-    title = str(data.get("title", "")).strip()
-    media_type = str(data.get("media_type", "")).strip()
-    url = str(data.get("url", "")).strip()
-    chapter = str(data.get("chapter", "")).strip()
-    page = str(data.get("page", "")).strip()
-
-    if not all([media_id, media_name, title, media_type, url]):
-        return jsonify({"error": "Fill in all required fields."}), 400
-
-    if len(media_name) > 150 or len(title) > 150:
-        return jsonify({"error": "Title is too long."}), 400
-
-    if len(url) > 2000:
-        return jsonify({"error": "URL is too long."}), 400
-
-    parsed = urlparse(url)
-
-    if parsed.scheme not in ("https", "http") or not parsed.hostname:
-        return jsonify({"error": "Enter a valid HTTP or HTTPS URL."}), 400
-
-    if parsed.username or parsed.password:
-        return jsonify({"error": "URLs containing credentials are not allowed."}), 400
-
-    allowed_types = [
-        "video",
-        "audio",
-        "file",
-        "manga_page"
-    ]
-
-    if media_type not in allowed_types:
-        return jsonify({"error": "Invalid media type."}), 400
-
-    if media_type == "manga_page":
-        if not chapter.isdigit() or not page.isdigit():
-            return jsonify({
-                "error": "Manga pages require numeric chapter and page numbers."
-            }), 400
-
-    try:
-        catalog, sha = read_catalog()
-
-        entry = {
-            "id": str(uuid.uuid4()),
-            "media_id": media_id,
-            "media_name": media_name,
-            "title": title,
-            "media_type": media_type,
-            "url": url,
-            "chapter": chapter,
-            "page": page
+def save_anime_items(items):
+    encoded_text = json.dumps(items, ensure_ascii=False, indent=2)
+    if GITHUB_TOKEN and GITHUB_OWNER and GITHUB_REPO:
+        url = github_file_url()
+        sha = None
+        get = HTTP.get(url, headers=github_headers(),
+                       params={"ref": GITHUB_BRANCH}, timeout=12)
+        if get.status_code == 200:
+            sha = get.json().get("sha")
+        elif get.status_code != 404:
+            get.raise_for_status()
+        payload = {
+            "message": "Update AnimeVerse anime links",
+            "content": base64.b64encode(encoded_text.encode("utf-8")).decode("ascii"),
+            "branch": GITHUB_BRANCH
         }
+        if sha:
+            payload["sha"] = sha
+        put = HTTP.put(url, headers=github_headers(), json=payload, timeout=15)
+        put.raise_for_status()
+        return "github"
+    with open(LOCAL_DB, "w", encoding="utf-8") as f:
+        f.write(encoded_text)
+    return "local"
 
-        catalog.setdefault("entries", []).append(entry)
+# ---------- Frontend ----------
 
-        write_catalog(catalog, sha)
-
-        return jsonify({
-            "success": True,
-            "entry": entry
-        })
-
-    except Exception:
-        app.logger.exception("GitHub catalog write failed")
-        return jsonify({
-            "error": "Could not save to GitHub. Check repository permissions."
-        }), 502
-
-
-# ============================================
-# DELETE MEDIA
-# ============================================
-
-@app.route("/api/media/delete", methods=["POST"])
-def delete_media():
-    data = request.get_json(silent=True) or {}
-
-    if not authorized(data):
-        return jsonify({"error": "Invalid admin password."}), 401
-
-    entry_id = str(data.get("id", "")).strip()
-
-    try:
-        catalog, sha = read_catalog()
-
-        original = catalog.get("entries", [])
-
-        catalog["entries"] = [
-            entry for entry in original
-            if entry.get("id") != entry_id
-        ]
-
-        if len(original) == len(catalog["entries"]):
-            return jsonify({"error": "Entry not found."}), 404
-
-        write_catalog(catalog, sha)
-
-        return jsonify({"success": True})
-
-    except Exception:
-        app.logger.exception("GitHub delete failed")
-        return jsonify({"error": "Could not delete entry."}), 502
-
-
-# ============================================
-# FRONTEND
-# ============================================
-
-HTML = r"""
-<!DOCTYPE html>
+PAGE = r"""<!doctype html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AnimeVerse</title>
-
 <style>
-* {
-    box-sizing: border-box;
-    margin: 0;
-    padding: 0;
-}
-
-body {
-    background: #090b13;
-    color: #f1f2f8;
-    font-family: Arial, sans-serif;
-}
-
-header {
-    background: #111625;
-    border-bottom: 1px solid #293047;
-    padding: 20px 5%;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    flex-wrap: wrap;
-    gap: 15px;
-}
-
-.logo {
-    font-size: 25px;
-    font-weight: 900;
-    color: #a78bfa;
-}
-
-.logo span {
-    color: white;
-}
-
-nav {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 9px;
-}
-
-nav button {
-    background: transparent;
-    color: #aeb4c6;
-}
-
-nav button.active,
-nav button:hover {
-    background: #29213f;
-    color: #c5b1ff;
-}
-
-.hero {
-    padding: 45px 5%;
-    background: linear-gradient(120deg,#21183b,#111a30);
-}
-
-.hero h1 {
-    font-size: clamp(30px,5vw,46px);
-    margin-bottom: 12px;
-}
-
-.hero h1 span {
-    color: #a78bfa;
-}
-
-.hero p {
-    color: #b4b8c9;
-    line-height: 1.7;
-}
-
-main {
-    padding: 35px 5%;
-}
-
-.section {
-    display: none;
-}
-
-.section.active {
-    display: block;
-}
-
-.toolbar {
-    display: flex;
-    gap: 10px;
-    flex-wrap: wrap;
-    margin-bottom: 25px;
-}
-
-input, select, textarea {
-    background: #151b2b;
-    color: white;
-    border: 1px solid #30384e;
-    border-radius: 8px;
-    padding: 13px;
-    width: 100%;
-}
-
-.toolbar input {
-    flex: 1;
-    min-width: 190px;
-}
-
-button {
-    background: #7958d8;
-    color: white;
-    border: none;
-    border-radius: 8px;
-    padding: 12px 17px;
-    cursor: pointer;
-    font-weight: bold;
-}
-
-button:hover {
-    background: #9577ef;
-}
-
-h2 {
-    margin-bottom: 20px;
-}
-
-.grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill,minmax(180px,1fr));
-    gap: 20px;
-}
-
-.card {
-    background: #141a29;
-    border: 1px solid #293047;
-    border-radius: 11px;
-    overflow: hidden;
-}
-
-.card img {
-    width: 100%;
-    height: 260px;
-    object-fit: cover;
-    background: #252b3b;
-}
-
-.card-content {
-    padding: 13px;
-}
-
-.card h3 {
-    font-size: 15px;
-    margin-bottom: 9px;
-}
-
-.muted {
-    color: #a2a9bc;
-    font-size: 12px;
-    line-height: 1.6;
-}
-
-.card button {
-    width: 100%;
-    margin-top: 10px;
-}
-
-.card a {
-    display: block;
-    text-align: center;
-    text-decoration: none;
-    background: #302548;
-    color: #d5c8ff;
-    padding: 11px;
-    border-radius: 7px;
-    margin-top: 8px;
-    font-size: 12px;
-}
-
-.reader {
-    background: #111725;
-    border: 1px solid #30384e;
-    border-radius: 12px;
-    padding: 18px;
-    text-align: center;
-}
-
-.reader img {
-    display: block;
-    max-width: 100%;
-    height: auto;
-    max-height: 85vh;
-    margin: 15px auto;
-    object-fit: contain;
-}
-
-.reader video,
-.reader audio {
-    width: 100%;
-    margin: 15px 0;
-}
-
-.reader-controls {
-    display: flex;
-    justify-content: center;
-    gap: 10px;
-    flex-wrap: wrap;
-    margin: 15px;
-}
-
-.form {
-    max-width: 650px;
-    background: #141a29;
-    border: 1px solid #30384e;
-    border-radius: 12px;
-    padding: 22px;
-}
-
-.form label {
-    display: block;
-    margin: 15px 0 7px;
-    color: #c5cadd;
-    font-size: 13px;
-}
-
-.form button {
-    margin-top: 18px;
-}
-
-.notice {
-    margin: 15px 0;
-    color: #b7a4ff;
-    font-size: 13px;
-}
-
-.media-entry {
-    background: #151b2b;
-    padding: 15px;
-    border-radius: 9px;
-    margin-bottom: 12px;
-}
-
-.media-entry a {
-    color: #bba8ff;
-}
-
-footer {
-    text-align: center;
-    padding: 30px;
-    border-top: 1px solid #252d40;
-    color: #858da2;
-    font-size: 12px;
-}
-
-@media(max-width:500px) {
-    .grid {
-        grid-template-columns: repeat(2,minmax(0,1fr));
-        gap: 11px;
-    }
-
-    .card img {
-        height: 210px;
-    }
-}
+:root{--bg:#090d18;--panel:#111a2b;--panel2:#172238;--line:#263650;--text:#edf3ff;--muted:#91a2bd;--a:#8b7cff;--b:#42d6bd;--danger:#ff7189}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 10% 0%,#1c2342 0,transparent 35%),var(--bg);color:var(--text);font:15px/1.5 Inter,Segoe UI,Arial,sans-serif}
+header{position:sticky;top:0;z-index:5;background:#0b1120ed;backdrop-filter:blur(14px);border-bottom:1px solid var(--line);padding:15px max(20px,calc((100vw - 1200px)/2));display:flex;align-items:center;gap:20px;flex-wrap:wrap}
+.brand{font-size:21px;font-weight:900;letter-spacing:.3px}.brand span{color:var(--a)}nav{display:flex;gap:8px;flex-wrap:wrap}button,.tab{border:1px solid var(--line);background:var(--panel2);color:var(--text);border-radius:11px;padding:10px 14px;cursor:pointer;font-weight:700}button:hover,.tab.active{border-color:var(--a);background:#29264b}.wrap{max-width:1200px;margin:28px auto;padding:0 20px}.hero{padding:26px;border:1px solid var(--line);border-radius:20px;background:linear-gradient(120deg,#171d36,#101a2b);margin-bottom:22px}.hero h1{margin:0 0 7px;font-size:clamp(25px,4vw,38px)}.muted{color:var(--muted)}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.grow{flex:1;min-width:220px}input,textarea,select{width:100%;padding:12px 13px;border:1px solid var(--line);background:#0b1322;color:var(--text);border-radius:10px;font:inherit}textarea{min-height:75px;resize:vertical}.field{margin:12px 0}.field label{display:block;font-weight:700;margin-bottom:6px}.primary{background:linear-gradient(120deg,#7768ef,#9a70ed);border:0}.success{background:#123c3a;border-color:#286c65}.danger{color:#ff9aab}.panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:18px;margin:18px 0}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:14px}.item{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px;min-width:0}.item a{color:#b8b0ff;text-decoration:none}.item a:hover{text-decoration:underline}.small{font-size:13px;color:var(--muted)}.cover{width:100%;height:190px;object-fit:cover;border-radius:10px;background:#202b40}.hidden{display:none!important}.notice{padding:12px;border-radius:10px;background:#1b2a40;color:#c8d8f2;margin:12px 0}.check{display:flex;gap:10px;align-items:flex-start;color:#d3def1}.check input{width:auto;margin-top:5px}.chapter{display:flex;justify-content:space-between;gap:12px;padding:11px 0;border-bottom:1px solid var(--line)}.readerbar{position:sticky;top:65px;z-index:3;background:#0b1120ed;padding:12px;border:1px solid var(--line);border-radius:12px;display:flex;gap:8px;align-items:center;justify-content:space-between;flex-wrap:wrap}.readerimg{display:block;max-width:100%;height:auto;margin:14px auto;border-radius:5px;background:#101827}.readerstage{text-align:center;background:#050912;border-radius:14px;padding:10px;min-height:300px}.pill{font-size:12px;border:1px solid var(--line);padding:4px 8px;border-radius:20px;color:var(--muted)}footer{text-align:center;color:var(--muted);padding:35px 10px}
 </style>
 </head>
-
 <body>
-
-<header>
-    <div class="logo">ANIME<span>VERSE</span></div>
-
-    <nav>
-        <button class="active" onclick="showTab('library',this)">Manga</button>
-        <button onclick="showTab('reader',this)">Reader</button>
-        <button onclick="showTab('media',this)">Media Library</button>
-        <button onclick="showTab('admin',this)">Admin</button>
-    </nav>
-</header>
-
-<section class="hero">
-    <h1>Your <span>Manga Universe.</span></h1>
-    <p>
-        Discover manga, read authorized image collections,
-        and organize your anime media library.
-    </p>
+<header><div class="brand">ANIME<span>VERSE</span></div><nav>
+<button class="tab active" data-tab="manga">Manga reader</button>
+<button class="tab" data-tab="anime">Anime library</button>
+<button class="tab" data-tab="admin">Manage anime</button>
+</nav></header>
+<main class="wrap">
+<section id="manga" class="section">
+<div class="hero"><h1>MangaTown Reader</h1><div class="muted">Load a MangaTown series, choose a chapter, and read supported pages here.</div></div>
+<div class="panel">
+<div class="field"><label>MangaTown series URL</label><input id="seriesUrl" placeholder="https://www.mangatown.com/manga/series_name/"></div>
+<label class="check"><input type="checkbox" id="rights" checked><span>I confirm I have permission to view and download this manga content, and that accessing it complies with the site's terms.</span></label>
+<div class="row" style="margin-top:14px"><button class="primary" onclick="loadSeries()">Scan series</button><span class="small" id="seriesStatus">Enter a MangaTown series URL to begin.</span></div>
+</div>
+<div id="seriesInfo" class="panel hidden"></div>
+<div id="chapterList" class="panel hidden"></div>
+<div id="reader" class="panel hidden">
+<div class="readerbar"><div><b id="readerTitle">Reader</b><div class="small" id="pageCount"></div></div><div class="row"><button onclick="changePage(-1)">← Previous</button><button onclick="changePage(1)">Next →</button><button class="success" onclick="downloadChapter()">Download chapter ZIP</button></div></div>
+<div class="readerstage" id="readerStage"><div class="muted">Chapter pages will appear here.</div></div>
+</div>
 </section>
-
-<main>
-
-<!-- MANGA LIBRARY -->
-
-<section id="library" class="section active">
-
-    <h2>Top 100 Manga</h2>
-
-    <div class="toolbar">
-        <input id="search" placeholder="Search manga...">
-        <button onclick="loadManga()">Search</button>
-        <button onclick="resetSearch()">Top 100</button>
-    </div>
-
-    <div id="manga-grid" class="grid">
-        Loading manga...
-    </div>
-
+<section id="anime" class="section hidden">
+<div class="hero"><h1>Anime library</h1><div class="muted">Your manually added anime links, separate from MangaTown.</div></div>
+<div class="row"><input class="grow" id="animeSearch" placeholder="Filter anime..." oninput="renderAnime()"><span class="pill" id="animeCount">0 titles</span></div>
+<div id="animeGrid" class="grid" style="margin-top:15px"></div>
 </section>
-
-
-<!-- MANGA READER -->
-
-<section id="reader" class="section">
-
-    <h2>Manga Reader</h2>
-
-    <p class="muted">
-        Read manga images added to your GitHub media catalog.
-    </p>
-
-    <div class="toolbar" style="margin-top:20px">
-        <input id="reader-id" placeholder="AniList manga ID">
-        <button onclick="loadReader()">Open manga</button>
-    </div>
-
-    <div id="reader-container" class="reader">
-        Select a manga to begin.
-    </div>
-
+<section id="admin" class="section hidden">
+<div class="hero"><h1>Manage anime links</h1><div class="muted">Add links to videos, episodes, or official anime pages.</div></div>
+<div class="panel">
+<div class="field"><label>Admin password</label><input id="adminPassword" type="password" placeholder="Your ADMIN_PASSWORD"></div>
+<div class="field"><label>Anime title</label><input id="animeTitle" placeholder="e.g. Example Anime"></div>
+<div class="field"><label>Link URL</label><input id="animeUrl" placeholder="https://..."></div>
+<div class="field"><label>Link type</label><select id="animeType"><option value="video">Video / stream</option><option value="episode">Episode page</option><option value="official">Official website</option><option value="other">Other link</option></select></div>
+<div class="field"><label>Cover image URL (optional)</label><input id="animeCover" placeholder="https://.../cover.jpg"></div>
+<div class="field"><label>Notes (optional)</label><textarea id="animeNotes" placeholder="Season, episode, language, etc."></textarea></div>
+<button class="primary" onclick="addAnime()">Save anime link</button><span class="small" id="adminStatus" style="margin-left:10px"></span>
+</div><div class="notice">If GitHub settings are configured, links are saved to your repository's <code>data/anime_links.json</code>. Otherwise, the app uses a local JSON file.</div>
 </section>
-
-
-<!-- MEDIA LIBRARY -->
-
-<section id="media" class="section">
-
-    <h2>Anime Media Library</h2>
-
-    <div class="toolbar">
-        <input id="media-id" placeholder="Anime or manga ID">
-        <button onclick="loadMedia()">Load media</button>
-    </div>
-
-    <div id="media-results"></div>
-
-</section>
-
-
-<!-- ADMIN -->
-
-<section id="admin" class="section">
-
-    <h2>Media Management</h2>
-
-    <p class="muted">
-        Add links to the GitHub catalog. Use the AniList ID
-        to connect entries to the correct series.
-    </p>
-
-    <div class="form">
-
-        <label>Admin password</label>
-        <input type="password" id="password">
-
-        <label>AniList ID</label>
-        <input id="add-id" placeholder="Example: 113415">
-
-        <label>Anime or manga title</label>
-        <input id="add-name" placeholder="Jujutsu Kaisen">
-
-        <label>Episode, chapter, or file name</label>
-        <input id="add-title" placeholder="Chapter 001 - Page 1">
-
-        <label>Media type</label>
-        <select id="add-type">
-            <option value="manga_page">Manga page image</option>
-            <option value="video">Video</option>
-            <option value="audio">Audio</option>
-            <option value="file">Other file</option>
-        </select>
-
-        <label>Chapter number (manga images)</label>
-        <input id="add-chapter" type="number" min="1" placeholder="1">
-
-        <label>Page number (manga images)</label>
-        <input id="add-page" type="number" min="1" placeholder="1">
-
-        <label>Media URL</label>
-        <input id="add-url" placeholder="https://example.com/file.mp4">
-
-        <button onclick="addMedia()">Save to GitHub</button>
-
-        <div id="admin-message" class="notice"></div>
-
-    </div>
-
-</section>
-
-</main>
-
-<footer>
-    AnimeVerse · Flask · AniList · GitHub
-</footer>
-
+</main><footer>AnimeVerse · Flask edition</footer>
 <script>
-
-let mangaList = [];
-let readerPages = [];
-let currentPage = 0;
-
-function esc(value) {
-    return String(value ?? "").replace(/[&<>"']/g, c => ({
-        "&": "&amp;",
-        "<": "&lt;",
-        ">": "&gt;",
-        '"': "&quot;",
-        "'": "&#39;"
-    })[c]);
-}
-
-function showTab(id, button) {
-    document.querySelectorAll(".section").forEach(
-        x => x.classList.remove("active")
-    );
-
-    document.getElementById(id).classList.add("active");
-
-    document.querySelectorAll("nav button").forEach(
-        x => x.classList.remove("active")
-    );
-
-    if (button) button.classList.add("active");
-}
-
-async function loadManga() {
-    const grid = document.getElementById("manga-grid");
-    const search = document.getElementById("search").value.trim();
-
-    grid.innerHTML = "Loading manga...";
-
-    try {
-        const response = await fetch(
-            "/api/manga?q=" + encodeURIComponent(search)
-        );
-
-        const data = await response.json();
-
-        if (!response.ok || !data.success) {
-            throw new Error(data.error || "Could not load manga.");
-        }
-
-        mangaList = data.manga;
-
-        if (!mangaList.length) {
-            grid.innerHTML = "No manga found.";
-            return;
-        }
-
-        grid.innerHTML = mangaList.map(m => `
-            <article class="card">
-
-                <img
-                    src="${esc(m.cover)}"
-                    alt="${esc(m.display_title)}"
-                    loading="lazy"
-                >
-
-                <div class="card-content">
-
-                    <h3>${esc(m.display_title)}</h3>
-
-                    <div class="muted">
-                        Score: ${m.averageScore ?? "N/A"} / 100<br>
-                        Chapters: ${m.chapters ?? "Unknown"}<br>
-                        Popularity: ${m.popularity ?? "Unknown"}
-                    </div>
-
-                    <button onclick="openReader('${m.id}')">
-                        Open built-in reader
-                    </button>
-
-                    <button onclick="loadMediaFor('${m.id}')">
-                        View media
-                    </button>
-
-                    <a href="${esc(m.mangatown_url)}"
-                       target="_blank"
-                       rel="noopener noreferrer">
-                        Open MangaTown series
-                    </a>
-
-                    <a href="${esc(m.siteUrl)}"
-                       target="_blank"
-                       rel="noopener noreferrer">
-                        Manga details
-                    </a>
-
-                </div>
-            </article>
-        `).join("");
-
-    } catch(error) {
-        grid.textContent = error.message;
-    }
-}
-
-function resetSearch() {
-    document.getElementById("search").value = "";
-    loadManga();
-}
-
-function openReader(id) {
-    document.getElementById("reader-id").value = id;
-    showTab("reader");
-    loadReader();
-}
-
-async function loadReader() {
-    const id = document.getElementById("reader-id").value.trim();
-
-    if (!id) return;
-
-    const container = document.getElementById("reader-container");
-
-    container.textContent = "Loading manga pages...";
-
-    try {
-        const response = await fetch(
-            "/api/media?media_id=" + encodeURIComponent(id)
-        );
-
-        const data = await response.json();
-
-        if (!response.ok || !data.success) {
-            throw new Error(data.error || "Could not load pages.");
-        }
-
-        readerPages = data.entries
-            .filter(x => x.media_type === "manga_page")
-            .sort((a,b) =>
-                Number(a.chapter) - Number(b.chapter) ||
-                Number(a.page) - Number(b.page)
-            );
-
-        currentPage = 0;
-
-        if (!readerPages.length) {
-            container.textContent =
-                "No manga pages have been added to this series yet.";
-            return;
-        }
-
-        renderReader();
-
-    } catch(error) {
-        container.textContent = error.message;
-    }
-}
-
-function renderReader() {
-    const container = document.getElementById("reader-container");
-
-    if (!readerPages.length) return;
-
-    const page = readerPages[currentPage];
-
-    container.innerHTML = `
-        <h3>${esc(page.media_name)}</h3>
-
-        <p class="muted">
-            Chapter ${esc(page.chapter)} ·
-            Page ${esc(page.page)} ·
-            ${currentPage + 1} of ${readerPages.length}
-        </p>
-
-        <img
-            src="${esc(page.url)}"
-            alt="${esc(page.title)}"
-            referrerpolicy="no-referrer"
-            onerror="this.alt='Image could not be loaded. Check the image URL and hosting permissions.'"
-        >
-
-        <div class="reader-controls">
-            <button onclick="previousPage()"
-                ${currentPage === 0 ? "disabled" : ""}>
-                Previous
-            </button>
-
-            <button onclick="nextPage()"
-                ${currentPage === readerPages.length - 1 ? "disabled" : ""}>
-                Next
-            </button>
-
-            <a href="${esc(page.url)}"
-               target="_blank"
-               rel="noopener noreferrer">
-                Open image
-            </a>
-        </div>
-    `;
-}
-
-function previousPage() {
-    if (currentPage > 0) {
-        currentPage--;
-        renderReader();
-    }
-}
-
-function nextPage() {
-    if (currentPage < readerPages.length - 1) {
-        currentPage++;
-        renderReader();
-    }
-}
-
-async function loadMediaFor(id) {
-    document.getElementById("media-id").value = id;
-    showTab("media");
-    await loadMedia();
-}
-
-async function loadMedia() {
-    const id = document.getElementById("media-id").value.trim();
-
-    const container = document.getElementById("media-results");
-
-    if (!id) {
-        container.textContent = "Enter an AniList ID.";
-        return;
-    }
-
-    container.textContent = "Loading media...";
-
-    try {
-        const response = await fetch(
-            "/api/media?media_id=" + encodeURIComponent(id)
-        );
-
-        const data = await response.json();
-
-        if (!response.ok || !data.success) {
-            throw new Error(data.error || "Unable to load media.");
-        }
-
-        if (!data.entries.length) {
-            container.textContent = "No media added yet.";
-            return;
-        }
-
-        container.innerHTML = data.entries.map(entry => {
-
-            let player = "";
-
-            if (entry.media_type === "video") {
-                player = `
-                    <video controls preload="metadata">
-                        <source src="${esc(entry.url)}">
-                        Your browser does not support this video.
-                    </video>
-                `;
-            } else if (entry.media_type === "audio") {
-                player = `
-                    <audio controls preload="metadata">
-                        <source src="${esc(entry.url)}">
-                    </audio>
-                `;
-            } else if (entry.media_type === "manga_page") {
-                player = `
-                    <img
-                        src="${esc(entry.url)}"
-                        style="max-width:100%;max-height:500px;object-fit:contain"
-                        alt="${esc(entry.title)}"
-                    >
-                `;
-            }
-
-            return `
-                <div class="media-entry">
-
-                    <h3>${esc(entry.title)}</h3>
-
-                    <p class="muted">
-                        ${esc(entry.media_type)}
-                        ${entry.chapter ? " · Chapter " + esc(entry.chapter) : ""}
-                        ${entry.page ? " · Page " + esc(entry.page) : ""}
-                    </p>
-
-                    ${player}
-
-                    <p style="margin-top:10px">
-                        <a href="${esc(entry.url)}"
-                           target="_blank"
-                           rel="noopener noreferrer">
-                            Open / Download file
-                        </a>
-                    </p>
-
-                </div>
-            `;
-        }).join("");
-
-    } catch(error) {
-        container.textContent = error.message;
-    }
-}
-
-async function addMedia() {
-    const message = document.getElementById("admin-message");
-
-    message.textContent = "Saving to GitHub...";
-
-    const payload = {
-        password: document.getElementById("password").value,
-        media_id: document.getElementById("add-id").value,
-        media_name: document.getElementById("add-name").value,
-        title: document.getElementById("add-title").value,
-        media_type: document.getElementById("add-type").value,
-        chapter: document.getElementById("add-chapter").value,
-        page: document.getElementById("add-page").value,
-        url: document.getElementById("add-url").value
-    };
-
-    try {
-        const response = await fetch("/api/media", {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify(payload)
-        });
-
-        const data = await response.json();
-
-        if (!response.ok || !data.success) {
-            throw new Error(data.error || "Save failed.");
-        }
-
-        message.textContent = "Saved successfully to GitHub!";
-
-        document.getElementById("add-title").value = "";
-        document.getElementById("add-url").value = "";
-        document.getElementById("add-page").value = "";
-
-    } catch(error) {
-        message.textContent = error.message;
-    }
-}
-
-loadManga();
-
+let currentSeries=null,currentImages=[],pageIndex=0,currentChapter=null,animeItems=[];
+document.querySelectorAll("[data-tab]").forEach(b=>b.onclick=()=>{document.querySelectorAll("[data-tab]").forEach(x=>x.classList.toggle("active",x===b));document.querySelectorAll(".section").forEach(x=>x.classList.toggle("hidden",x.id!==b.dataset.tab));if(b.dataset.tab==="anime")loadAnime();});
+async function api(url,opts={}){let r=await fetch(url,opts);let d=await r.json().catch(()=>({error:"Unexpected server response"}));if(!r.ok)throw new Error(d.error||"Request failed");return d}
+async function loadSeries(){const url=document.getElementById("seriesUrl").value.trim();const status=document.getElementById("seriesStatus");if(!document.getElementById("rights").checked){status.textContent="Please confirm you have permission first.";return}status.textContent="Scanning MangaTown series…";try{const d=await api("/api/manga/series",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url,authorized:true})});currentSeries=d;document.getElementById("seriesInfo").classList.remove("hidden");document.getElementById("seriesInfo").innerHTML=`<h2>${esc(d.title)}</h2><div class="small"><a target="_blank" rel="noopener" href="${esc(d.url)}">Open original MangaTown series</a> · ${d.chapters.length} chapters found</div>`;const list=document.getElementById("chapterList");list.classList.remove("hidden");list.innerHTML="<h3>Chapters</h3>"+(d.chapters.length?d.chapters.map((c,i)=>`<div class="chapter"><span>${esc(c.title)}</span><button onclick="openChapter(${i})">Read</button></div>`).join(""):"<p class='muted'>No chapter links were found. MangaTown may have changed its page layout.</p>");status.textContent="Series scan complete."}catch(e){status.textContent=e.message}}
+async function openChapter(i){if(!document.getElementById("rights").checked){alert("Confirm you have permission to view this content.");return}const c=currentSeries.chapters[i];const box=document.getElementById("reader");box.classList.remove("hidden");document.getElementById("readerTitle").textContent=currentSeries.title+" · "+c.title;document.getElementById("readerStage").innerHTML="<p class='muted'>Scanning chapter pages…</p>";try{const d=await api("/api/manga/chapter",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url:c.url,authorized:true})});currentImages=d.images||[];pageIndex=0;currentChapter={title:c.title,url:c.url};showPage();box.scrollIntoView({behavior:"smooth"})}catch(e){document.getElementById("readerStage").textContent=e.message}}
+function showPage(){const stage=document.getElementById("readerStage");if(!currentImages.length){stage.innerHTML="<p class='muted'>No page images were detected. Try opening the chapter on MangaTown to check whether it is available.</p>";document.getElementById("pageCount").textContent="0 pages";return}const src=currentImages[pageIndex];stage.innerHTML=`<img class="readerimg" src="${esc(src)}" alt="Manga page ${pageIndex+1}" referrerpolicy="no-referrer" onerror="this.insertAdjacentHTML('afterend','<p class=muted>Image could not be loaded by the browser.</p>')">`;document.getElementById("pageCount").textContent=`Page ${pageIndex+1} of ${currentImages.length}`; }
+function changePage(n){if(!currentImages.length)return;pageIndex=Math.max(0,Math.min(currentImages.length-1,pageIndex+n));showPage()}
+async function downloadChapter(){if(!document.getElementById("rights").checked){alert("Confirm you have permission to download this content.");return}if(!currentChapter)return;try{const d=await api("/api/manga/download",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url:currentChapter.url,authorized:true})});location.href=d.download_url}catch(e){alert(e.message)}}
+async function loadAnime(){try{const d=await api("/api/anime");animeItems=d.items||[];renderAnime()}catch(e){document.getElementById("animeGrid").textContent=e.message}}
+function renderAnime(){const q=(document.getElementById("animeSearch").value||"").toLowerCase();const list=animeItems.filter(x=>(x.title||"").toLowerCase().includes(q));document.getElementById("animeCount").textContent=list.length+" titles";document.getElementById("animeGrid").innerHTML=list.map(x=>`<article class="item">${x.cover?`<img class="cover" src="${esc(x.cover)}" alt="">`:""}<h3>${esc(x.title)}</h3><span class="pill">${esc(x.type||"link")}</span><p class="small">${esc(x.notes||"")}</p><a href="${esc(x.url)}" target="_blank" rel="noopener">Open link ↗</a></article>`).join("")||"<p class='muted'>No anime links have been added yet.</p>"}
+async function addAnime(){const s=document.getElementById("adminStatus");s.textContent="Saving…";try{const d=await api("/api/anime",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:document.getElementById("adminPassword").value,title:document.getElementById("animeTitle").value,url:document.getElementById("animeUrl").value,type:document.getElementById("animeType").value,cover:document.getElementById("animeCover").value,notes:document.getElementById("animeNotes").value})});s.textContent="Saved ("+d.storage+").";["animeTitle","animeUrl","animeCover","animeNotes"].forEach(id=>document.getElementById(id).value="");}catch(e){s.textContent=e.message}}
+function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
+loadAnime();
 </script>
+</body></html>"""
 
-</body>
-</html>
-"""
-
-
-@app.route("/")
+@app.get("/")
 def home():
-    return render_template_string(HTML)
+    return render_template_string(PAGE)
 
-
-@app.route("/health")
+@app.get("/health")
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"ok": True, "app": "AnimeVerse"})
 
+@app.post("/api/manga/series")
+def manga_series():
+    data = request.get_json(silent=True) or {}
+    if not data.get("authorized"):
+        return jsonify(error="Confirm that you have permission to view this content."), 403
+    url = (data.get("url") or "").strip()
+    try:
+        return jsonify(parse_series(url))
+    except Exception as e:
+        return jsonify(error=str(e)), 400
+
+@app.post("/api/manga/chapter")
+def manga_chapter():
+    data = request.get_json(silent=True) or {}
+    if not data.get("authorized"):
+        return jsonify(error="Confirm that you have permission to view this content."), 403
+    url = (data.get("url") or "").strip()
+    try:
+        result = parse_reader_page(url)
+        if not result["images"]:
+            return jsonify(error="No reader images were found. The page may require JavaScript or a site-supported browser."), 404
+        return jsonify(result)
+    except Exception as e:
+        return jsonify(error=str(e)), 400
+
+@app.post("/api/manga/download")
+def manga_download():
+    data = request.get_json(silent=True) or {}
+    if not data.get("authorized"):
+        return jsonify(error="Confirm that you have permission to download this content."), 403
+    url = (data.get("url") or "").strip()
+    try:
+        parsed = parse_reader_page(url)
+        if not parsed["images"]:
+            return jsonify(error="No page images were found."), 404
+        # Build a short-lived in-memory ZIP. Only public image URLs are fetched.
+        mem = io.BytesIO()
+        with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as z:
+            count = 0
+            for i, image_url in enumerate(parsed["images"], 1):
+                if not safe_public_url(image_url):
+                    continue
+                try:
+                    r = HTTP.get(image_url, timeout=HTTP_TIMEOUT, stream=True)
+                    r.raise_for_status()
+                    content = bytearray()
+                    for chunk in r.iter_content(65536):
+                        content.extend(chunk)
+                        if len(content) > MAX_IMAGE_BYTES:
+                            raise ValueError("An image exceeded the download size limit.")
+                    ctype = r.headers.get("Content-Type", "")
+                    if not ctype.startswith("image/"):
+                        continue
+                    ext = os.path.splitext(urlparse(image_url).path)[1].lower()
+                    if ext not in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"):
+                        ext = ".jpg"
+                    z.writestr(f"page_{i:03d}{ext}", bytes(content))
+                    count += 1
+                except Exception:
+                    continue
+            if not count:
+                return jsonify(error="No downloadable images were retrieved. The image host may block server requests."), 400
+        mem.seek(0)
+        import uuid
+        token = uuid.uuid4().hex
+        DOWNLOADS[token] = mem.getvalue()
+        return jsonify(download_url=f"/download/{token}")
+    except Exception as e:
+        return jsonify(error=str(e)), 400
+
+DOWNLOADS = {}
+
+@app.get("/download/<token>")
+def download_file(token):
+    content = DOWNLOADS.pop(token, None)
+    if content is None:
+        abort(404)
+    return Response(content, mimetype="application/zip",
+                    headers={"Content-Disposition": 'attachment; filename="manga_chapter.zip"'})
+
+@app.get("/api/anime")
+def anime_list():
+    return jsonify(items=load_anime_items())
+
+@app.post("/api/anime")
+def anime_add():
+    data = request.get_json(silent=True) or {}
+    supplied = str(data.get("password") or "")
+    if not ADMIN_PASSWORD or not __import__("hmac").compare_digest(supplied, ADMIN_PASSWORD):
+        return jsonify(error="Incorrect admin password."), 403
+    title = clean_text(data.get("title"))
+    url = (data.get("url") or "").strip()
+    if not title or not url or not safe_public_url(url):
+        return jsonify(error="Enter a title and a valid public HTTP(S) link."), 400
+    cover = (data.get("cover") or "").strip()
+    if cover and not safe_public_url(cover):
+        return jsonify(error="Cover image must be a public HTTP(S) URL."), 400
+    item = {
+        "id": __import__("uuid").uuid4().hex[:12],
+        "title": title[:140],
+        "url": url,
+        "type": clean_text(data.get("type"))[:30] or "other",
+        "cover": cover,
+        "notes": clean_text(data.get("notes"))[:500]
+    }
+    try:
+        with lock:
+            items = load_anime_items()
+            items.insert(0, item)
+            save_anime_items(items)
+        return jsonify(ok=True, storage="GitHub" if GITHUB_TOKEN and GITHUB_OWNER and GITHUB_REPO else "local file")
+    except Exception as e:
+        return jsonify(error="Could not save links: " + str(e)), 500
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    port = int(os.environ.get("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port)
