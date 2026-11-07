@@ -1,0 +1,244 @@
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background: #0c0e13;
+    color: #f3f4f7;
+    font-family: Inter, Arial, sans-serif;
+}
+
+header {
+    height: 72px;
+    padding: 0 5%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid #282d38;
+    background: #10131a;
+}
+
+.brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    color: white;
+    font-weight: 800;
+    font-size: 19px;
+    text-decoration: none;
+}
+
+.logo {
+    display: grid;
+    place-items: center;
+    width: 38px;
+    height: 38px;
+    background: #f0bd55;
+    color: #17130c;
+    border-radius: 9px;
+    font-size: 20px;
+}
+
+.header-label,
+.eyebrow,
+label span {
+    color: #929bad;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 1.5px;
+}
+
+main {
+    width: min(1040px, 90%);
+    margin: auto;
+}
+
+.hero {
+    padding: 75px 0 42px;
+}
+
+h1 {
+    font-size: clamp(44px, 7vw, 70px);
+    line-height: 1;
+    letter-spacing: -3px;
+    margin: 15px 0;
+}
+
+h1 span {
+    color: #f0bd55;
+}
+
+.hero p {
+    color: #a7afbd;
+    max-width: 520px;
+    line-height: 1.7;
+}
+
+.reader {
+    background: linear-gradient(145deg, #191e28, #131720);
+    border: 1px solid #303744;
+    border-radius: 17px;
+    padding: 28px;
+}
+
+.reader-heading,
+.catalog-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 15px;
+}
+
+h2 {
+    margin: 8px 0 0;
+    font-size: 24px;
+}
+
+.tag {
+    color: #f0bd55;
+    font-size: 10px;
+    letter-spacing: 1px;
+}
+
+.controls {
+    display: grid;
+    grid-template-columns: 1fr 130px auto;
+    gap: 14px;
+    align-items: end;
+    margin-top: 28px;
+}
+
+label {
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+}
+
+select,
+input {
+    min-height: 48px;
+    width: 100%;
+    background: #0e121a;
+    border: 1px solid #3b4555;
+    border-radius: 8px;
+    padding: 0 12px;
+    color: white;
+}
+
+button {
+    cursor: pointer;
+    font: inherit;
+}
+
+#readButton {
+    min-height: 48px;
+    padding: 0 20px;
+    background: #f0bd55;
+    color: #19150e;
+    border: none;
+    border-radius: 8px;
+    font-weight: 800;
+}
+
+#readButton:hover {
+    background: #ffd47d;
+}
+
+#message {
+    color: #a7afbd;
+    font-size: 13px;
+    line-height: 1.6;
+    margin: 18px 0;
+}
+
+.secondary {
+    background: transparent;
+    color: white;
+    border: 1px solid #485264;
+    padding: 10px 14px;
+    border-radius: 8px;
+}
+
+.catalog-section {
+    padding: 55px 0 30px;
+}
+
+.catalog {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+    margin-top: 22px;
+}
+
+.manga-card {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    text-align: left;
+    padding: 13px;
+    background: #151922;
+    color: white;
+    border: 1px solid #2b313e;
+    border-radius: 11px;
+}
+
+.manga-card:hover {
+    border-color: #d2a64e;
+    background: #1d222d;
+}
+
+.symbol {
+    display: grid;
+    place-items: center;
+    width: 38px;
+    height: 38px;
+    border-radius: 8px;
+    background: #292f3b;
+    color: #f0bd55;
+    font-weight: 900;
+}
+
+.manga-name {
+    flex: 1;
+    font-size: 13px;
+    font-weight: 700;
+}
+
+.arrow {
+    color: #929bad;
+}
+
+footer {
+    border-top: 1px solid #282d38;
+    margin-top: 35px;
+    padding: 24px 0 35px;
+    color: #778194;
+    font-size: 11px;
+    line-height: 1.6;
+}
+
+@media (max-width: 700px) {
+    .controls {
+        grid-template-columns: 1fr 110px;
+    }
+
+    #readButton {
+        grid-column: 1 / -1;
+    }
+
+    .catalog {
+        grid-template-columns: repeat(2, 1fr);
+    }
+
+    .reader {
+        padding: 20px;
+    }
+}
+
+@media (max-width: 420px) {
+    .catalog {
+        grid-template-columns: 1fr;
+    }
+}
