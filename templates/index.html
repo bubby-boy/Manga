@@ -1,0 +1,168 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MangaShelf</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<header>
+    <a class="brand" href="/">
+        <span class="logo">読</span>
+        MangaShelf
+    </a>
+    <span class="header-label">MANGA PLUS LIBRARY</span>
+</header>
+
+<main>
+    <section class="hero">
+        <div class="eyebrow">YOUR MANGA LIBRARY</div>
+        <h1>Find your next<br><span>chapter.</span></h1>
+        <p>
+            Choose a manga, select a chapter, and continue
+            reading through the official MANGA Plus website.
+        </p>
+    </section>
+
+    <section class="reader">
+        <div class="reader-heading">
+            <div>
+                <div class="eyebrow">CHAPTER LAUNCHER</div>
+                <h2>Open a chapter</h2>
+            </div>
+            <span class="tag">OFFICIAL SOURCE</span>
+        </div>
+
+        {% if manga %}
+        <div class="controls">
+            <label>
+                <span>MANGA SERIES</span>
+                <select id="manga">
+                    {% for item in manga %}
+                    <option value="{{ item.name }}">
+                        {{ item.name }}
+                    </option>
+                    {% endfor %}
+                </select>
+            </label>
+
+            <label>
+                <span>CHAPTER</span>
+                <input id="chapter" type="number"
+                       min="1" max="9999" value="1">
+            </label>
+
+            <button id="readButton">Read chapter ↗</button>
+        </div>
+
+        <p id="message">
+            Select a manga and chapter to begin.
+        </p>
+
+        <button class="secondary" id="seriesButton">
+            Open official series page ↗
+        </button>
+        {% else %}
+        <p>No manga entries found. Check manga_ids.txt.</p>
+        {% endif %}
+    </section>
+
+    <section class="catalog-section">
+        <div class="catalog-heading">
+            <div>
+                <div class="eyebrow">YOUR COLLECTION</div>
+                <h2>Manga catalog</h2>
+            </div>
+            <span>{{ manga|length }} SERIES</span>
+        </div>
+
+        <div class="catalog">
+            {% for item in manga %}
+            <button class="manga-card"
+                    data-name="{{ item.name }}">
+                <span class="symbol">{{ item.name[0] }}</span>
+                <span class="manga-name">{{ item.name }}</span>
+                <span class="arrow">↗</span>
+            </button>
+            {% endfor %}
+        </div>
+    </section>
+
+    <footer>
+        MangaShelf is an independent launcher and is not affiliated
+        with Shueisha or MANGA Plus. Manga content remains on the
+        official website.
+    </footer>
+</main>
+
+<script>
+const manga = document.getElementById("manga");
+const chapter = document.getElementById("chapter");
+const message = document.getElementById("message");
+
+async function getLinks() {
+    const params = new URLSearchParams({
+        manga: manga.value,
+        chapter: chapter.value || "1"
+    });
+
+    const response = await fetch("/api/chapter?" + params);
+    const data = await response.json();
+
+    if (!response.ok) {
+        throw new Error(data.error || "Unable to get chapter.");
+    }
+
+    return data;
+}
+
+document.getElementById("readButton")?.addEventListener(
+    "click", async () => {
+        try {
+            const data = await getLinks();
+            message.textContent = data.message;
+
+            window.open(
+                data.url,
+                "_blank",
+                "noopener,noreferrer"
+            );
+        } catch (error) {
+            message.textContent = error.message;
+        }
+    }
+);
+
+document.getElementById("seriesButton")?.addEventListener(
+    "click", async () => {
+        try {
+            const data = await getLinks();
+
+            window.open(
+                data.title_url,
+                "_blank",
+                "noopener,noreferrer"
+            );
+        } catch (error) {
+            message.textContent = error.message;
+        }
+    }
+);
+
+document.querySelectorAll(".manga-card").forEach(card => {
+    card.addEventListener("click", () => {
+        manga.value = card.dataset.name;
+        chapter.value = 1;
+
+        document.querySelector(".reader").scrollIntoView({
+            behavior: "smooth"
+        });
+    });
+});
+</script>
+
+</body>
+</html>
