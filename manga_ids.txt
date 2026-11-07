@@ -1,0 +1,19 @@
+
+# MANGA PLUS CATALOG
+#
+# FORMAT:
+# Manga Name | Chapter 1 Viewer ID | Official Title Page URL
+#
+# Put 0 if you only have the title page URL.
+# Viewer IDs are not guaranteed to be sequential.
+
+Black Clover | 1000177 | https://mangaplus.shueisha.co.jp/titles/100003
+Boruto | 1018835 | https://mangaplus.shueisha.co.jp/titles/100026
+Naruto | 1000397 | https://mangaplus.shueisha.co.jp/titles/100018
+One Piece | 1000486 | https://mangaplus.shueisha.co.jp/titles/100020
+Sakamoto Days | 1008203 | https://mangaplus.shueisha.co.jp/titles/100022
+Spy x Family | 1001834 | https://mangaplus.shueisha.co.jp/titles/100056
+Death Note | 0 | https://mangaplus.shueisha.co.jp/titles/100008
+
+# ADD MORE BELOW:
+# Example Manga | 1001234 | https://mangaplus.shueisha.co.jp/titles/100999
